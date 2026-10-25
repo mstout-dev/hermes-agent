@@ -1212,14 +1212,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 from plugins.platforms.discord.adapter_media import DiscordMediaMixin
+from plugins.platforms.discord.adapter_mentions import DiscordMentionMixin
 from plugins.platforms.discord.adapter_authorization import DiscordAuthorizationMixin
 from plugins.platforms.discord.adapter_slash_auth import DiscordSlashAuthMixin
 from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
 
 
-class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin,
-                     DiscordSlashAuthMixin, BasePlatformAdapter):
+class DiscordAdapter(
+    DiscordAuthorizationMixin, DiscordMediaMixin, DiscordMentionMixin, DiscordThreadTitlesMixin,
+    DiscordVoiceInfoMixin, DiscordSlashAuthMixin, BasePlatformAdapter,
+):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
@@ -5120,27 +5123,6 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
         return self._gate_csv_set(raw)
 
-    def _raw_mentioned_user_ids(self, message: Any) -> set:
-        """Extract user-mention IDs (``<@ID>`` and legacy ``<@!ID>``) from raw content,
-        since ``message.mentions`` isn't always populated (mobile/edited/relayed)."""
-        content = getattr(message, "content", "") or ""
-        return {match.group(1) for match in re.finditer(r"<@!?(\d+)>", content)}
-
-    def _self_is_explicitly_mentioned(self, message: Any) -> bool:
-        """True when the bot is in ``message.mentions`` or raw-mentioned in the content."""
-        if not self._client or not self._client.user:
-            return False
-        if self._client.user in getattr(message, "mentions", []):
-            return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
-
-    def _self_is_raw_mentioned(self, message: Any) -> bool:
-        """True only for a literal ``<@bot>`` token: reply-pings add us to ``message.mentions``
-        without one, and the bot admission gate must tell those apart."""
-        if not self._client or not self._client.user:
-            return False
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
-
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
 
@@ -6120,9 +6102,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 normalized_content = raw_content
         if self._self_is_explicitly_mentioned(message):
             mention_prefix = True
-            if self._client.user:
-                normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
-                normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            normalized_content = self._normalize_self_mentions(message, normalized_content)
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}

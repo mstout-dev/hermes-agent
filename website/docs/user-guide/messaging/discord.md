@@ -15,7 +15,7 @@ Before setup, here's the part most people want to know: how Hermes behaves once 
 | Context | Behavior |
 |---------|----------|
 | **DMs** | Hermes responds to every message. No `@mention` needed. Each DM has its own session. |
-| **Server channels** | By default, Hermes only responds when you `@mention` it. If you post in a channel without mentioning it, Hermes ignores the message. |
+| **Server channels** | By default, Hermes responds when you `@mention` its bot account or its own managed bot role. Discord lists both under the bot's name. Other role mentions do not trigger it. |
 | **Free-response channels** | You can make specific channels mention-free with `DISCORD_FREE_RESPONSE_CHANNELS`, or disable mentions globally with `DISCORD_REQUIRE_MENTION=false`. Messages in these channels are answered inline by default — auto-threading is skipped so the channel stays a lightweight chat. Set `discord.free_response_auto_thread: true` to get both mention-free replies and a thread per top-level message. |
 | **Threads** | Hermes replies in the same thread. Mention rules still apply unless that thread or its parent channel is configured as free-response. Threads stay isolated from the parent channel for session history. |
 | **Shared channels with multiple users** | By default, Hermes isolates session history per user inside the channel for safety and clarity. Two people talking in the same channel do not share one transcript unless you explicitly disable that. |
