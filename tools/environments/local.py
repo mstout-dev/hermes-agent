@@ -1105,12 +1105,19 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         self._recover_cwd()
+        from tools.process_workload_scope import local_workload_argv
+        from tools.process_registry import systemd_user_bus_env
+        args, systemd_unit = local_workload_argv(args)
+        run_env = _make_run_env(self.env)
+        if systemd_unit:
+            run_env = systemd_user_bus_env(run_env)
         proc = subprocess.Popen(
-            args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
+            args, text=True, env=run_env, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        proc._hermes_systemd_unit = systemd_unit
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
@@ -1131,6 +1138,9 @@ class LocalEnvironment(BaseEnvironment):
         except OSError:  # ProcessLookupError / PermissionError included
             with contextlib.suppress(Exception):
                 proc.kill()
+        from tools.process_workload_scope import stop_foreground_scope
+        if not stop_foreground_scope(proc):
+            logger.warning("Foreground scope cleanup failed: %s", proc._hermes_systemd_unit)
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
@@ -1146,6 +1156,9 @@ class LocalEnvironment(BaseEnvironment):
                 os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX only (_IS_WINDOWS returned above)
         with contextlib.suppress(OSError):
             proc.kill()
+        from tools.process_workload_scope import stop_foreground_scope
+        if not stop_foreground_scope(proc, force=True):
+            logger.warning("Foreground scope force-kill failed: %s", proc._hermes_systemd_unit)
 
     def _extract_cwd_from_output(self, result: dict):
         """Base semantics plus: Git Bash ``pwd -P`` emits MSYS form on Windows —

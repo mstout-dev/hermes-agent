@@ -1,0 +1,9 @@
+[Unit]
+Description=Bounded Hermes terminal workloads
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=12G
+MemoryMax=16G
+MemorySwapMax=2G
+TasksMax=512
