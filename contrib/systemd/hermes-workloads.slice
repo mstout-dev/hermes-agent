@@ -1,5 +1,5 @@
 [Unit]
-Description=Bounded Hermes terminal workloads
+Description=Bounded Hermes terminal and language-server workloads
 
 [Slice]
 MemoryAccounting=yes

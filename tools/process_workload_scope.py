@@ -104,11 +104,11 @@ def local_workload_argv(
     return scoped, unit
 
 
-def stop_foreground_scope(proc, *, force: bool = False) -> bool:
+def stop_foreground_scope(proc=None, *, unit: str = "", force: bool = False) -> bool:
     """Stop even daemonized descendants after the caller signals the parent/group."""
     from tools import process_registry as registry
 
-    unit = getattr(proc, "_hermes_systemd_unit", "")
+    unit = unit or getattr(proc, "_hermes_systemd_unit", "")
     if not unit:
         return True
     if not force:
