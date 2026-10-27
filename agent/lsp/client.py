@@ -279,6 +279,7 @@ class LSPClient:
                     local_workload_argv,
                     cmd,
                     unit_suffix=f"lsp-{uuid.uuid4().hex[:12]}",
+                    memory_ceiling_bytes=4 * 1024**3,
                 )
             except WorkloadScopeUnavailable as e:
                 raise LSPProtocolError(f"LSP server requires an available bounded workload scope: {e}") from e

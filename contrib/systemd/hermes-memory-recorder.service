@@ -15,7 +15,7 @@ MemoryHigh=128M
 MemoryMax=256M
 MemorySwapMax=0
 CPUQuota=20%
-TasksMax=16
+TasksMax=infinity
 Nice=10
 
 [Install]

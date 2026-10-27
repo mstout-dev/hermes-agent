@@ -122,11 +122,11 @@ _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 
-def _worker_memory_max_bytes() -> int:
+def _worker_memory_max_bytes(*, ceiling_bytes: int = _WORKER_MEMORY_MAX_CAP_BYTES) -> int:
     """Finite per-worker cgroup limit that can never widen host risk.
     ``TERMINAL_LOCAL_MEMORY_MAX_MB`` is honored only when it *tightens* the safe
-    bound (min of the gateway's cgroup-v2 ``memory.max`` and half of physical RAM,
-    capped at 4 GiB), so an oversized override cannot exceed the enclosing slice.
+    bound (min of the gateway's cgroup-v2 ``memory.max``, half of physical RAM,
+    and the caller's ceiling), so an oversized override cannot exceed its scope.
 
     The proposed local-memory-guard environment override is honored when it tightens the safe bound, so this
     isolation composes with PR #57121 instead of inventing a second knob.
@@ -165,14 +165,12 @@ def _worker_memory_max_bytes() -> int:
         physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
             os.sysconf("SC_PAGE_SIZE")
         )
-        physical_bound = min(
-            _WORKER_MEMORY_MAX_CAP_BYTES,
-            max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
-        )
+        physical_bound = max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2)
         candidates.append(physical_bound)
     except (OSError, ValueError, TypeError):
         pass
-    safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
+    safe_bound = min(candidates) if candidates else min(_DEFAULT_WORKER_MEMORY_MAX_BYTES, ceiling_bytes)
+    safe_bound = min(safe_bound, ceiling_bytes)
     return min(override_bound, safe_bound) if override_bound else safe_bound
 
 

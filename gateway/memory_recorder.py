@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from gateway.memory_recorder_store import RecorderStore, validate_output_dir
+from gateway.memory_recorder_store import RecorderStore, _cgroup_event_deltas, validate_output_dir
 
 SCHEMA_VERSION = 1
 SAMPLE_INTERVAL_SECONDS = 2.0
@@ -23,6 +23,7 @@ MAX_INTERVAL_SECONDS = 30.0
 MAX_PROCESSES = 2048
 MAX_PROC_READS = 8192
 MAX_CGROUPS = 256
+MAX_CGROUP_PATH_BYTES = 512
 MAX_RECORD_BYTES = 512 * 1024
 MAX_SAMPLE_BYTES = MAX_RECORD_BYTES - 1024
 MAX_PSS_PROCESSES = 8
@@ -220,23 +221,64 @@ def _mount_usage(target: Path) -> dict[str, Any]:
         return {"target": str(target), "total_bytes": None, "free_bytes": None, "allocated_bytes": None}
 
 
-def _cgroup_rows(paths: set[str], sys_root: Path) -> tuple[list[dict[str, Any]], int]:
+def _workload_cgroup_path() -> str:
+    uid = Path.home().stat().st_uid
+    return f"/user.slice/user-{uid}.slice/user@{uid}.service/hermes.slice/hermes-workloads.slice"
+
+
+def _workload_cgroup_paths() -> set[str]:
+    workload = _workload_cgroup_path()
+    return {str(parent) for parent in Path(workload).parents} | {workload}
+
+
+def _cgroup_rows(paths: set[str], sys_root: Path, boot_id: str) -> tuple[list[dict[str, Any]], int]:
     rows = []
-    ordered = sorted(paths)
+    reserved = _workload_cgroup_paths()
+    ordered = sorted(paths & reserved) + sorted(paths - reserved)
     for rel in ordered[:MAX_CGROUPS]:
         base = sys_root / "fs" / "cgroup" / rel.lstrip("/")
+        try:
+            before = base.stat()
+        except OSError:
+            continue
         stat = _read_text(base / "memory.stat", 8192)
         stats = dict(line.split()[:2] for line in (stat or "").splitlines() if len(line.split()) >= 2)
-        rows.append({"name": _safe_label(rel), "memory_current_bytes": _integer(_read_text(base / "memory.current", 64)), "swap_current_bytes": _integer(_read_text(base / "memory.swap.current", 64)), "anon_bytes": _integer(stats.get("anon")), "file_bytes": _integer(stats.get("file")), "shmem_bytes": _integer(stats.get("shmem")), "oom_events": _event_value(base / "memory.events", "oom"), "oom_kill_events": _event_value(base / "memory.events", "oom_kill")})
+        aggregate_workload_events = rel == _workload_cgroup_path()
+        event_suffix = "" if aggregate_workload_events else ".local"
+        memory_events = _event_values(base / f"memory.events{event_suffix}")
+        pids_events = _event_values(base / f"pids.events{event_suffix}")
+        values = {
+            "memory_current_bytes": _integer(_read_text(base / "memory.current", 64)),
+            "swap_current_bytes": _integer(_read_text(base / "memory.swap.current", 64)),
+            "anon_bytes": _integer(stats.get("anon")),
+            "file_bytes": _integer(stats.get("file")),
+            "shmem_bytes": _integer(stats.get("shmem")),
+            "oom_events": _integer(memory_events.get("oom")),
+            "oom_kill_events": _integer(memory_events.get("oom_kill")),
+            "pids_denied_events": _integer(pids_events.get("max")),
+            "event_counter_scope": "hierarchical" if aggregate_workload_events else "local",
+            "pids_current": _integer(_read_text(base / "pids.current", 64)),
+            "pids_max": _integer(_read_text(base / "pids.max", 64)),
+        }
+        try:
+            after = base.stat()
+        except OSError:
+            continue
+        if before.st_ino != after.st_ino:
+            continue
+        rows.append({
+            "name": _safe_label(rel),
+            "identity": {"boot_id": boot_id, "path": rel[:MAX_CGROUP_PATH_BYTES], "inode": before.st_ino},
+            **values,
+        })
     return rows, max(0, len(ordered) - len(rows))
 
 
-def _event_value(path: Path, key: str) -> int | None:
+def _event_values(path: Path) -> dict[str, str]:
     raw = _read_text(path, 4096)
     if raw is None:
-        return None
-    values = dict(line.split()[:2] for line in raw.splitlines() if len(line.split()) >= 2)
-    return _integer(values.get(key))
+        return {}
+    return dict(line.split()[:2] for line in raw.splitlines() if len(line.split()) >= 2)
 
 
 def _encode_bounded(record: dict[str, Any]) -> tuple[bytes, int]:
@@ -287,7 +329,8 @@ def collect_sample(proc_root: Path = Path("/proc"), sys_root: Path = Path("/sys"
     cgroup_paths = {path for entry in processes if (path := _cgroup_path(proc_root / str(entry["identity"]["pid"]))) is not None}
     for group in tuple(cgroup_paths):
         cgroup_paths.update(str(parent) for parent in Path(group).parents)
-    cgroups, omitted_cgroups = _cgroup_rows(cgroup_paths, sys_root)
+    cgroup_paths.update(_workload_cgroup_paths())
+    cgroups, omitted_cgroups = _cgroup_rows(cgroup_paths, sys_root, boot_id)
     uid_path = Path("/run/user") / str(Path.home().stat().st_uid)
     record = {
         "schema_version": SCHEMA_VERSION,
@@ -326,6 +369,13 @@ def classify_pressure(current: dict[str, Any], previous: dict[str, Any] | None) 
         reasons.append("available_below_2gib")
     if previous is None:
         return reasons
+    event_deltas = _cgroup_event_deltas(current, previous)
+    if any(row["oom_delta"] for row in event_deltas):
+        reasons.append("cgroup_oom_event")
+    if any(row["oom_kill_delta"] for row in event_deltas):
+        reasons.append("cgroup_oom_kill_event")
+    if any(row["pids_max_delta"] for row in event_deltas):
+        reasons.append("cgroup_pids_denied_event")
     elapsed = max(0.1, current["monotonic_seconds"] - previous["monotonic_seconds"])
     threshold_kib = PRESSURE_RISE_PER_TWO_SECONDS * elapsed / SAMPLE_INTERVAL_SECONDS / 1024
     swap_now = current["host"]["swaps"].get("used_kib")

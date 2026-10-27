@@ -9,7 +9,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 WORKLOAD_SLICE = "hermes-workloads.slice"
-_AGGREGATE_LIMITS = ("MemoryMax", "MemorySwapMax", "TasksMax")
+_AGGREGATE_LIMITS = ("MemoryMax", "MemorySwapMax")
 
 
 class WorkloadScopeUnavailable(RuntimeError):
@@ -43,7 +43,7 @@ def required_workload_scope() -> bool:
     return _local_config().get("require_workload_scope") is True
 
 
-def _require_bounded_slice() -> None:
+def _require_bounded_slice() -> int:
     """Reject missing/unbounded slices: systemd would otherwise create one implicitly."""
     from tools import process_registry as registry
 
@@ -64,17 +64,19 @@ def _require_bounded_slice() -> None:
             bounded = bounded and raw.isdigit()
             if name != "MemorySwapMax":
                 bounded = bounded and raw.isdigit() and int(raw) > 0
+        memory_max = values.get("MemoryMax", "")
         if bounded:
-            return
+            return int(memory_max)
     except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError) as exc:
         raise WorkloadScopeUnavailable(f"cannot verify bounded {WORKLOAD_SLICE}") from exc
     raise WorkloadScopeUnavailable(
-        f"local terminal requires loaded {WORKLOAD_SLICE} with finite memory, swap and task limits"
+        f"local terminal requires loaded {WORKLOAD_SLICE} with finite memory and swap limits"
     )
 
 
 def local_workload_argv(
     argv: list[str], unit_suffix: str | None = None, *, required: bool = False,
+    memory_ceiling_bytes: int | None = None,
 ) -> tuple[list[str], str]:
     """Return the unchanged command or its required bounded scope and owned unit name."""
     from tools import process_registry as registry
@@ -83,12 +85,14 @@ def local_workload_argv(
         return argv, ""
     if not registry._systemd_run_user_scope_available():
         raise WorkloadScopeUnavailable("local terminal requires a reachable systemd user scope; command not started")
-    _require_bounded_slice()
+    aggregate_memory_max = _require_bounded_slice()
     suffix = unit_suffix or f"foreground-{uuid.uuid4().hex[:12]}"
     scoped = registry._build_systemd_scope_argv(argv, unit_suffix=suffix)
     if scoped == argv:
         raise WorkloadScopeUnavailable("systemd-run disappeared; local command not started")
-    maximum = registry._worker_memory_max_bytes()
+    maximum = registry._worker_memory_max_bytes(ceiling_bytes=aggregate_memory_max)
+    if memory_ceiling_bytes is not None:
+        maximum = min(maximum, memory_ceiling_bytes)
     configured = _local_config().get("memory_max_mb")
     if configured is not None:
         if isinstance(configured, bool) or not isinstance(configured, int) or configured < 64:
@@ -98,7 +102,7 @@ def local_workload_argv(
     scoped[memory_index] = f"MemoryMax={maximum}"
     index = scoped.index("--")
     scoped[index:index] = ["--slice", WORKLOAD_SLICE, "--property", "MemorySwapMax=0",
-                           "--property", "TasksMax=256"]
+                           "--property", "TasksMax=infinity"]
     unit = f"hermes-worker-{suffix}.scope"
     logger.debug("Local terminal isolated in %s under %s (MemoryMax=%d)", unit, WORKLOAD_SLICE, maximum)
     return scoped, unit
