@@ -293,9 +293,9 @@ DEFAULT_CONFIG = {
         # non-positive poll) warn and fall back to defaults. See agent/turn_liveness.py.
         "turn_liveness": {"timeout_s": 600.0, "poll_s": 15.0},
     },
-
     "terminal": {
         "backend": "local",
+        "local": {"require_workload_scope": False, "memory_max_mb": None},
         "modal_mode": "auto",
         # Remote-backend connection-class failures (SSH host unreachable, Docker daemon down):
         # "warn" = structured degraded tool result with reason + retry hint; "fail" = raise error +

@@ -1376,24 +1376,23 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    expected_run_id: int | None = None,
+    expected_claim_lock: str | None = None,
 ) -> bool:
-    """Record a non-success outcome and maybe trip the circuit breaker; every
-    non-success path funnels through here so ``consecutive_failures`` stays
-    consistent. Returns True when the task was auto-blocked.
+    """Count a non-success outcome; return True when the task was auto-blocked.
 
-    ``release_claim=True, end_run=True``: spawn-failure path (task still
-    running with an open run — restore source phase or ``blocked``, release
-    claim, close run). Both False: timeout/crash path (caller already restored
-    the phase and closed the run; only the counter moves, a trip flips to
-    ``blocked`` + ``gave_up``). Threshold: per-task ``max_retries`` >
-    ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``. ``force_trip`` trips
-    unconditionally (caller applied its own bounded-retry policy).
+    With ``release_claim=True, end_run=True``, restore the claim's source phase
+    (or block), release it and close its run. With both False, the timeout/crash
+    caller already released and closed it; only count the failure and maybe block.
+    Threshold: task ``max_retries`` > ``failure_limit`` > ``DEFAULT_FAILURE_LIMIT``.
+    ``force_trip`` applies the caller's unconditional bounded-retry policy.
 
-    ``infrastructure=True``: the host refused the spawn (no restart-safe scope,
-    #114720) — nothing about the card ran, so the run and event are recorded
-    with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
-    the breaker never trips; the card stays retryable and
-    :func:`check_respawn_guard` spaces the retries.
+    ``infrastructure=True`` records a host-refused spawn (#114720) without
+    consuming failures or tripping; ``check_respawn_guard`` spaces retries.
+
+    Worker callbacks supply both expected identity fields: the entire failure
+    is a no-op unless that exact task/run still holds an open running claim.
+    Dispatcher paths that already closed a run omit both.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1401,7 +1400,13 @@ def _record_task_failure(
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "FROM tasks WHERE id = ? AND (? = 0 OR (status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ? AND EXISTS ("
+            "SELECT 1 FROM task_runs r WHERE r.id = tasks.current_run_id "
+            "AND r.task_id = tasks.id AND r.claim_lock = tasks.claim_lock "
+            "AND r.status = 'running' AND r.ended_at IS NULL)))",
+            (task_id, expected_run_id is not None or expected_claim_lock is not None,
+             expected_run_id, expected_claim_lock),
         ).fetchone()
         if row is None:
             return False
@@ -1412,7 +1417,6 @@ def _record_task_failure(
         )
         failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
 
-        # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
         if task_override is not None:
             effective_limit, limit_source = int(task_override), "task"
@@ -1421,7 +1425,6 @@ def _record_task_failure(
 
         if infrastructure or not (force_trip or failures >= effective_limit):
             if release_claim:
-                # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -1446,8 +1449,6 @@ def _record_task_failure(
                 _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
             return False
 
-        # Spawn path (release_claim) is still running and also clears claim
-        # state; the timeout/crash path already did.
         conn.execute(
             "UPDATE tasks SET status = 'blocked', "
             + ("claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -1466,7 +1467,6 @@ def _record_task_failure(
         }
         run_id = None
         if end_run:
-            # Only the spawn path has an open run to close.
             run_id = _kb._end_run(
                 conn, task_id, outcome="gave_up", status="gave_up", error=error,
                 metadata={

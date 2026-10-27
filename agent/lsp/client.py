@@ -14,6 +14,7 @@ import contextlib
 import logging
 import os
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -164,12 +165,17 @@ class LSPClient:
         self._seed_first_push = seed_diagnostics_on_first_push
 
         self._proc: Optional[asyncio.subprocess.Process] = None
+        # The unit is client-owned from before create_subprocess_exec begins. The launcher
+        # can outlive its asyncio Process wrapper, and cancellation can prevent that wrapper
+        # from ever being attached even though systemd started the unit.
+        self._scope_unit = ""
         self._stderr_task: Optional[asyncio.Task] = None
         # Ring buffer of the most recent server stderr lines, surfaced when spawn/initialize fails.
         self._stderr_tail: list[str] = []
         self._exit_code: Optional[int] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._cleanup_lock = asyncio.Lock()
+        self._spawn_lock = asyncio.Lock()
         self._next_id: int = 0
         self._pending: dict[int, asyncio.Future] = {}
 
@@ -258,26 +264,61 @@ class LSPClient:
             raise
 
     async def _spawn(self) -> None:
-        from agent.delegation_context import delegated_child_subprocess_env
-        from tools.environments.local import hermes_subprocess_env
-        cmd = self._command
-        if sys.platform == "win32" and cmd[0].lower().endswith((".cmd", ".bat")):
-            cmd = ["cmd.exe", "/c", *cmd]  # CreateProcess can't run .cmd/.bat shims directly
-        try:
-            # start_new_session=True gives the server its own process group; otherwise it inherits
-            # the gateway's pgid and mcp_tool's orphan sweeper can killpg() the TUI parent with it.
-            # windows_hide_flags() suppresses the console window a .cmd shim would flash from a
-            # console-less host (CREATE_NO_WINDOW; 0 on POSIX).
-            # Language servers are third-party binaries a write_file can start: they get the
-            # scrubbed env (no gateway tokens, no provider keys), plus their own configured env.
-            self._proc = await asyncio.create_subprocess_exec(
-                cmd[0], *cmd[1:], limit=_STREAM_LIMIT,
-                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=delegated_child_subprocess_env({**hermes_subprocess_env(), **(self._env or {})}), cwd=self._cwd,
-                start_new_session=True, creationflags=windows_hide_flags(),
-            )
-        except FileNotFoundError as e:
-            raise LSPProtocolError(f"LSP server binary not found: {cmd[0]} ({e})") from e
+        async with self._spawn_lock:
+            from agent.delegation_context import delegated_child_subprocess_env
+            from tools.environments.local import hermes_subprocess_env
+
+            cmd = self._command
+            if sys.platform == "win32" and cmd[0].lower().endswith((".cmd", ".bat")):
+                cmd = ["cmd.exe", "/c", *cmd]  # CreateProcess can't run .cmd/.bat shims directly
+            child_env = delegated_child_subprocess_env({**hermes_subprocess_env(), **(self._env or {})})
+            try:
+                from tools.process_workload_scope import WorkloadScopeUnavailable, local_workload_argv
+
+                launch_argv, unit = await asyncio.to_thread(
+                    local_workload_argv,
+                    cmd,
+                    unit_suffix=f"lsp-{uuid.uuid4().hex[:12]}",
+                )
+            except WorkloadScopeUnavailable as e:
+                raise LSPProtocolError(f"LSP server requires an available bounded workload scope: {e}") from e
+
+            # Publish ownership before the next await. If cancellation arrives while
+            # systemd-run or the server is starting, cleanup can still stop this unit.
+            self._scope_unit = unit
+            if unit:
+                from tools.process_registry import systemd_user_bus_env
+
+                child_env = systemd_user_bus_env(child_env)
+            try:
+                # start_new_session=True gives the server its own process group; otherwise it inherits
+                # the gateway's pgid and mcp_tool's orphan sweeper can killpg() the TUI parent with it.
+                # windows_hide_flags() suppresses the console window a .cmd shim would flash from a
+                # console-less host (CREATE_NO_WINDOW; 0 on POSIX).
+                spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(
+                    launch_argv[0], *launch_argv[1:], limit=_STREAM_LIMIT,
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    env=child_env, cwd=self._cwd,
+                    start_new_session=True, creationflags=windows_hide_flags(),
+                ))
+                cancelled = False
+                while True:
+                    try:
+                        proc = await asyncio.shield(spawn_task)
+                        break
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        if spawn_task.done():
+                            proc = spawn_task.result()
+                            break
+                        current = asyncio.current_task()
+                        if current is not None:
+                            current.uncancel()
+                self._proc = proc
+                if cancelled:
+                    raise asyncio.CancelledError
+            except FileNotFoundError as e:
+                raise LSPProtocolError(f"LSP server binary not found: {cmd[0]} ({e})") from e
         # stderr must be drained or the pipe buffer fills and the server hangs.
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._reader_task = asyncio.create_task(self._reader_loop())
@@ -428,26 +469,28 @@ class LSPClient:
             await self._cleanup_process()
 
     async def _cleanup_process(self) -> None:
-        async with self._cleanup_lock:
-            tasks = [self._reader_task, self._stderr_task]
-            self._reader_task = self._stderr_task = None
-            proc, self._proc = self._proc, None
-            live = [t for t in tasks if t is not None and not t.done() and t is not asyncio.current_task()]
-            for t in live:
-                t.cancel()
-            await asyncio.gather(*live, return_exceptions=True)
-            if proc is None:
-                return
-            if proc.returncode is not None:
-                if self._exit_code is None:
-                    self._exit_code = proc.returncode
-                return
+        async with self._spawn_lock:
+            async with self._cleanup_lock:
+                tasks = [self._reader_task, self._stderr_task]
+                self._reader_task = self._stderr_task = None
+                proc = self._proc
+                if self._state in _LIVE_STATES:
+                    self._state = "error"
+                live = [t for t in tasks if t is not None and not t.done() and t is not asyncio.current_task()]
+                try:
+                    for task in live:
+                        task.cancel()
+                    await asyncio.gather(*live, return_exceptions=True)
+                    await self._reap_process(proc)
+                finally:
+                    await self._stop_owned_scope()
+                self._proc = None
+
+    async def _reap_process(self, proc) -> None:
+        if proc is None:
+            return
+        if proc.returncode is None:
             try:
-                # ``shutdown`` has already given the protocol a grace period.  Hard-kill
-                # the tree while its ancestry is still observable: waiting for the launcher
-                # after SIGTERM can let an ignoring descendant become reparented and escape.
-                # Windows maps this to a synchronous taskkill /T /F (up to 15s), so the
-                # kill runs off the event loop.
                 from agent.deadline import kill_process_tree
 
                 if not await asyncio.to_thread(kill_process_tree, proc.pid):
@@ -456,8 +499,23 @@ class LSPClient:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
             except ProcessLookupError:
                 pass
-            if self._exit_code is None and proc.returncode is not None:
-                self._exit_code = proc.returncode
+        if self._exit_code is None and proc.returncode is not None:
+            self._exit_code = proc.returncode
+
+    async def _stop_owned_scope(self) -> None:
+        if not self._scope_unit:
+            return
+        from tools.process_workload_scope import stop_foreground_scope
+
+        unit = self._scope_unit
+        stopped = await asyncio.to_thread(stop_foreground_scope, unit=unit)
+        if not stopped:
+            forced = await asyncio.to_thread(stop_foreground_scope, unit=unit, force=True)
+            stopped = forced and await asyncio.to_thread(stop_foreground_scope, unit=unit)
+        if stopped:
+            self._scope_unit = ""
+        else:
+            logger.error("[%s] failed to stop owned LSP workload scope %s", self.server_id, unit)
 
     # ---- request / notification plumbing ----
 

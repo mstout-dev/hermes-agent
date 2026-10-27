@@ -1,0 +1,22 @@
+[Unit]
+Description=Bounded Hermes host memory history
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes/hermes-agent
+ExecStart=/usr/bin/python3 -m gateway.memory_recorder --output-dir %h/.hermes/logs/memory-recorder
+Slice=app.slice
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+UMask=0077
+MemoryAccounting=yes
+MemoryHigh=128M
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=20%
+TasksMax=16
+Nice=10
+
+[Install]
+WantedBy=default.target
