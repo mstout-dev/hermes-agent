@@ -9,3 +9,7 @@ The runner gives one foreground command a private disk-backed temporary
 directory, records its existing process scope, and removes the directory only
 after the owned processes have stopped. TERM, HUP, and INT request bounded
 cleanup and return `128 + signal`; SIGKILL cannot run cleanup.
+
+`hermes-company-env` loads the saved company binding and Node 24. Install it in
+your local executable directory. It selects bundled libvips for Sharp so a
+host libvips installation does not force nested builds to compile Sharp from source.
