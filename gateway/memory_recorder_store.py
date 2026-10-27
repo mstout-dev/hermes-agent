@@ -180,7 +180,9 @@ class RecorderStore:
                 deltas.append({"identity": identity, "rss_swap_delta_kib": delta, "new_process": old is None})
         deltas.sort(key=lambda item: item["rss_swap_delta_kib"], reverse=True)
         cgroup_deltas = _cgroup_deltas(sample, previous)
-        return {"schema_version": 1, "kind": "event", "boot_id": sample.get("boot_id"), "event_started_monotonic": started, "sampled_at": sample["sampled_at"], "reasons": reasons, "identities_and_deltas": deltas[:16], "cgroup_deltas": cgroup_deltas[:16], "global_swap_delta_kib": _swap_delta(sample, previous), "available_kib": sample["host"]["memory"].get("available_kib")}
+        cgroup_event_deltas = _cgroup_event_deltas(sample, previous)
+        cgroup_event_deltas.sort(key=lambda row: (row["oom_kill_delta"], row["oom_delta"], row["pids_max_delta"]), reverse=True)
+        return {"schema_version": 1, "kind": "event", "boot_id": sample.get("boot_id"), "event_started_monotonic": started, "sampled_at": sample["sampled_at"], "reasons": reasons, "identities_and_deltas": deltas[:16], "cgroup_deltas": cgroup_deltas[:16], "cgroup_event_deltas": cgroup_event_deltas[:16], "omitted_cgroup_event_deltas": max(0, len(cgroup_event_deltas) - 16), "global_swap_delta_kib": _swap_delta(sample, previous), "available_kib": sample["host"]["memory"].get("available_kib")}
 
     def _append_bounded(self, path: Path, record: dict[str, Any], limit: int, *, rotate: bool = False) -> None:
         raw = (json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n").encode()
@@ -267,3 +269,52 @@ def _cgroup_deltas(sample: dict[str, Any], previous: dict[str, Any] | None) -> l
         if current > old_total:
             changes.append({"cgroup": row["name"], "memory_swap_delta_bytes": current - old_total})
     return sorted(changes, key=lambda row: row["memory_swap_delta_bytes"], reverse=True)
+
+
+def _cgroup_event_deltas(sample: dict[str, Any], previous: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if previous is None:
+        return []
+    old = {
+        _cgroup_identity_key(row): row for row in previous["cgroups"]
+        if _cgroup_identity_key(row) is not None
+    }
+    changes = []
+    for row in sample["cgroups"]:
+        identity_key = _cgroup_identity_key(row)
+        before = old.get(identity_key) if identity_key is not None else None
+        if before is None:
+            continue
+        deltas = {}
+        for field, output in (("oom_events", "oom_delta"), ("oom_kill_events", "oom_kill_delta"), ("pids_denied_events", "pids_max_delta")):
+            current_count, previous_count = row.get(field), before.get(field)
+            deltas[output] = current_count - previous_count if current_count is not None and previous_count is not None and current_count >= previous_count else 0
+        if any(deltas.values()):
+            changes.append({"identity": _cgroup_identity(row), **deltas})
+    hierarchical = {
+        _cgroup_identity_key(row) for row in sample["cgroups"]
+        if row.get("event_counter_scope") == "hierarchical"
+    }
+    aggregates = [row for row in changes if _cgroup_identity_key(row) in hierarchical]
+    result = []
+    for row in changes:
+        for field in ("oom_delta", "oom_kill_delta", "pids_max_delta"):
+            if any(parent[field] and row["identity"]["path"].startswith(parent["identity"]["path"] + "/") for parent in aggregates):
+                row[field] = 0
+        if any(row[field] for field in ("oom_delta", "oom_kill_delta", "pids_max_delta")):
+            result.append(row)
+    return result
+
+
+def _cgroup_identity(row: dict[str, Any]) -> dict[str, Any] | None:
+    identity = row.get("identity")
+    if not isinstance(identity, dict):
+        return None
+    boot_id, path, inode = identity.get("boot_id"), identity.get("path"), identity.get("inode")
+    if not isinstance(boot_id, str) or not isinstance(path, str) or isinstance(inode, bool) or not isinstance(inode, int):
+        return None
+    return {"boot_id": boot_id, "path": path, "inode": inode}
+
+
+def _cgroup_identity_key(row: dict[str, Any]) -> tuple[str, str, int] | None:
+    identity = _cgroup_identity(row)
+    return (identity["boot_id"], identity["path"], identity["inode"]) if identity is not None else None

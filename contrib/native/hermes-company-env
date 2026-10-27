@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+
+hermes_company_env() {
+  local mode="$1"
+  shift
+  local company="${HERMES_KANBAN_BOARD:-}"
+  local runtime="$HOME/.local/share/hermes-paperclip/node24/bin"
+  local env_root="$HOME/.local/share/hermes-paperclip/env"
+  local env_file permissions
+
+  if [[ "$mode" == execute && "${1:-}" == --company ]]; then
+    if [[ $# -lt 2 ]]; then
+      printf '%s\n' 'Usage: hermes-company-env [--company COMPANY] [--] COMMAND [ARG ...]' >&2
+      return 2
+    fi
+    company="$2"
+    shift 2
+  fi
+  if [[ "$mode" == execute && "${1:-}" == -- ]]; then
+    shift
+  fi
+  if [[ ! -x "$runtime/node" || "$("$runtime/node" --version)" != v24.* ]]; then
+    printf '%s\n' 'The shared Node 24 runtime is missing or invalid.' >&2
+    return 1
+  fi
+  export PATH="$runtime:$PATH"
+  export SHARP_IGNORE_GLOBAL_LIBVIPS=1
+  unset QA_STUDIO_CREDENTIALS_FILE QA_CUSTOMER_CREDENTIALS_FILE QA_ENV_FILE LLD_QA_CMS_IDENTITY_FILE
+  case "$company" in
+    danceclarity|lovelivedance) ;;
+    *)
+      if [[ "$mode" == source ]]; then
+        return 0
+      fi
+      printf '%s\n' 'Select --company danceclarity or lovelivedance, or set HERMES_KANBAN_BOARD.' >&2
+      return 2
+      ;;
+  esac
+  if [[ "$mode" == execute && $# == 0 ]]; then
+    printf '%s\n' 'A command is required.' >&2
+    return 2
+  fi
+  env_file="$env_root/$company.env"
+  permissions="$(stat -c '%a' "$env_root" 2>/dev/null || stat -f '%Lp' "$env_root" 2>/dev/null)"
+  if [[ ! -d "$env_root" || ! -O "$env_root" || "$permissions" != 700 ]]; then
+    printf '%s\n' 'The company environment directory must be owned by this user with permissions 0700.' >&2
+    return 1
+  fi
+  permissions="$(stat -c '%a' "$env_file" 2>/dev/null || stat -f '%Lp' "$env_file" 2>/dev/null)"
+  if [[ ! -f "$env_file" || -L "$env_file" || ! -O "$env_file" || "$permissions" != 600 ]]; then
+    printf 'Company environment must be a private, owned file with permissions 0600: %s\n' "$env_file" >&2
+    return 1
+  fi
+  source "$env_file" || return
+  unset QA_STUDIO_CREDENTIALS_FILE QA_CUSTOMER_CREDENTIALS_FILE QA_ENV_FILE
+  if [[ "$company" == danceclarity ]]; then
+    export QA_STUDIO_CREDENTIALS_FILE="$HOME/.local/share/hermes-paperclip/runtime-config/danceclarity/qa-studio-identity.json"
+    export QA_CUSTOMER_CREDENTIALS_FILE="$HOME/.local/share/hermes-paperclip/runtime-config/danceclarity/qa-customer-identity.json"
+    export QA_ENV_FILE="$HOME/.local/share/hermes-paperclip/runtime-config/danceclarity/qa-authenticated-env.json"
+  fi
+  if [[ "$mode" == execute ]]; then
+    exec "$@"
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  hermes_company_env source
+else
+  hermes_company_env execute "$@"
+fi

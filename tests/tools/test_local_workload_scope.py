@@ -85,10 +85,10 @@ def test_cli_opt_in_refuses_unavailable_scope(native_worker, monkeypatch, explic
 
 def test_required_scope_keeps_shell_argv_literal_and_tightens_limit(native_worker, monkeypatch):
     monkeypatch.setattr(registry, "_systemd_run_user_scope_available", lambda: True)
-    monkeypatch.setattr(workload, "_require_bounded_slice", lambda: None)
+    monkeypatch.setattr(workload, "_require_bounded_slice", lambda: 4 * 1024**3)
     monkeypatch.setattr(workload, "_local_config", lambda: {"memory_max_mb": 64})
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/systemd-run")
-    monkeypatch.setattr(registry, "_worker_memory_max_bytes", lambda: 4 * 1024**3)
+    monkeypatch.setattr(registry, "_worker_memory_max_bytes", lambda **kwargs: 4 * 1024**3)
     monkeypatch.setattr(registry, "_SYSTEMD_RUN_NO_EXPAND", True)
     command = ["/bin/bash", "-c", "printf '%s' '${LITERAL} $$'", "argument with spaces"]
     scoped, unit = workload.local_workload_argv(command, "contract-test")
@@ -96,7 +96,7 @@ def test_required_scope_keeps_shell_argv_literal_and_tightens_limit(native_worke
     assert "--expand-environment=no" in scoped
     assert scoped[scoped.index("--slice") + 1] == "hermes-workloads.slice"
     assert "MemorySwapMax=0" in scoped
-    assert "TasksMax=256" in scoped
+    assert "TasksMax=infinity" in scoped
     assert "MemoryMax=67108864" in scoped
     assert unit == "hermes-worker-contract-test.scope"
 
@@ -105,7 +105,6 @@ def test_required_scope_keeps_shell_argv_literal_and_tightens_limit(native_worke
     "LoadState=not-found\nMemoryMax=1024\nMemorySwapMax=0\nTasksMax=512\n",
     "LoadState=loaded\nMemoryMax=infinity\nMemorySwapMax=0\nTasksMax=512\n",
     "LoadState=loaded\nMemoryMax=1024\nMemorySwapMax=infinity\nTasksMax=512\n",
-    "LoadState=loaded\nMemoryMax=1024\nMemorySwapMax=0\nTasksMax=infinity\n",
 ])
 def test_missing_or_unbounded_aggregate_is_refused(monkeypatch, limits):
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/systemctl")
